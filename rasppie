@@ -4,49 +4,26 @@ import csv
 from datetime import datetime
 import pytz
 
-# List of stocks you want to track
+# List of stocks to track
 symbols = ["AAPL", "TSLA", "MSFT", "AMZN"]
 
 # PST timezone
 pst = pytz.timezone("America/Los_Angeles")
 
-def get_csv_filename():
-    """Return today's CSV filename based on PST date."""
-    today = datetime.now(pst).strftime("%Y-%m-%d")
-    return f"stock_data_{today}.csv"
-
-# Create today's CSV with header if not exists
-def ensure_csv_exists():
-    filename = get_csv_filename()
-    try:
-        with open(filename, "x", newline="") as f:   # "x" = create only if not exists
-            writer = csv.writer(f)
-            writer.writerow(["Time_PST", "Symbol", "Last", "Bid", "Ask", "Mark"])
-    except FileExistsError:
-        pass  # File already exists
-
-ensure_csv_exists()
+# Create rapid.csv with header if not exists
+try:
+    with open("rapid.csv", "x", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Time_PST", "Symbol", "Last", "Bid", "Ask", "Mark"])
+except FileExistsError:
+    pass  # File already exists
 
 while True:
-    now_dt = datetime.now(pst)
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # Determine interval based on time
-    market_open = now_dt.replace(hour=6, minute=30, second=0, microsecond=0)
-    market_close = now_dt.replace(hour=13, minute=0, second=0, microsecond=0)
-
-    if market_open <= now_dt <= market_close:
-        interval = 1   # 1-second updates during market hours
-    else:
-        interval = 5   # 5-second updates outside market hours
-
-    # Ensure today's CSV exists (new day rollover)
-    ensure_csv_exists()
-    filename = get_csv_filename()
+    now = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S")
 
     for symbol in symbols:
         try:
-            url = f"https://api.robinhood.com/quotes/{symbol}/"
+            url = "https://api.robinhood.com/quotes/{}/".format(symbol)
             data = requests.get(url).json()
 
             last_trade = float(data["last_trade_price"])
@@ -54,14 +31,14 @@ while True:
             ask = float(data["ask_price"])
             mark_price = (bid + ask) / 2
 
-            # Write one row per stock
-            with open(filename, "a", newline="") as f:
+            # Append to rapid.csv
+            with open("rapid.csv", "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([now_str, symbol, last_trade, bid, ask, round(mark_price, 4)])
+                writer.writerow([now, symbol, last_trade, bid, ask, round(mark_price, 4)])
 
-            print(now_str, symbol, "Last:", last_trade, "Bid:", bid, "Ask:", ask, "Mark:", round(mark_price, 4))
+            print(now, symbol, "Last:", last_trade, "Bid:", bid, "Ask:", ask, "Mark:", round(mark_price, 4))
 
         except Exception as e:
             print("Error with", symbol, ":", e)
 
-    time.sleep(interval)
+    time.sleep(2)

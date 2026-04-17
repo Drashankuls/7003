@@ -1,44 +1,148 @@
+from flask import Flask, render_template_string
 import requests
-import time
-import csv
-from datetime import datetime
 import pytz
+from datetime import datetime
 
-# List of stocks to track
-symbols = ["AAPL", "TSLA", "MSFT", "AMZN"]
+app = Flask(__name__)
 
-# PST timezone
 pst = pytz.timezone("America/Los_Angeles")
 
-# Create rapid.csv with header if not exists
-try:
-    with open("rapid.csv", "x", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Time_PST", "Symbol", "Last", "Bid", "Ask", "Mark"])
-except FileExistsError:
-    pass  # File already exists
+# List your stocks here
+symbols = ["AAPL", "TSLA", "MSFT", "AMZN"]
 
-while True:
-    now = datetime.now(pst).strftime("%Y-%m-%d %H:%M:%S")
+# Store last price + swing info
+state = {}
+for s in symbols:
+    state[s] = {
+        "prev": None,
+        "last_swing_time": None,
+        "last_swing_type": None
+    }
+
+# Helper to convert missing values to "null"
+def safe(value):
+    if value is None:
+        return "null"
+    return value
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Stock Table</title>
+    <meta http-equiv="refresh" content="2">
+    <style>
+        body { background:#111; color:white; font-family:Arial; }
+        table { border-collapse: collapse; width: 90%; margin-top:20px; }
+        th, td { border:1px solid #444; padding:8px; text-align:center; }
+        th { background:#222; }
+        tr:nth-child(even) { background:#1a1a1a; }
+    </style>
+</head>
+<body>
+    <h2>Live Stock Prices</h2>
+    <table>
+        <tr>
+            <th>Symbol</th>
+            <th>Last</th>
+            <th>Ask</th>
+            <th>Bid</th>
+            <th>Spread</th>
+            <th>Last Swing (ago)</th>
+            <th>Swing Type</th>
+        </tr>
+        {% for row in rows %}
+        <tr>
+            <td>{{ row.symbol }}</td>
+            <td>{{ row.last }}</td>
+            <td>{{ row.ask }}</td>
+            <td>{{ row.bid }}</td>
+            <td>{{ row.spread }}</td>
+            <td>{{ row.swing_ago }}</td>
+            <td>{{ row.swing_type }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    rows = []
+    now = datetime.now(pst)
 
     for symbol in symbols:
         try:
             url = "https://api.robinhood.com/quotes/{}/".format(symbol)
             data = requests.get(url).json()
 
-            last_trade = float(data["last_trade_price"])
-            bid = float(data["bid_price"])
-            ask = float(data["ask_price"])
-            mark_price = (bid + ask) / 2
+            # Extract safely
+            last_raw = data.get("last_trade_price")
+            ask_raw = data.get("ask_price")
+            bid_raw = data.get("bid_price")
 
-            # Append to rapid.csv
-            with open("rapid.csv", "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([now, symbol, last_trade, bid, ask, round(mark_price, 4)])
+            if last_raw is None or ask_raw is None or bid_raw is None:
+                last_price = None
+                ask_price = None
+                bid_price = None
+                spread = None
+            else:
+                last_price = float(last_raw)
+                ask_price = float(ask_raw)
+                bid_price = float(bid_raw)
+                spread = ask_price - bid_price
 
-            print(now, symbol, "Last:", last_trade, "Bid:", bid, "Ask:", ask, "Mark:", round(mark_price, 4))
+            prev = state[symbol]["prev"]
+            swing_type = state[symbol]["last_swing_type"]
+            swing_time = state[symbol]["last_swing_time"]
 
-        except Exception as e:
-            print("Error with", symbol, ":", e)
+            # Swing detection only if valid price
+            if last_price is not None and prev is not None:
+                if last_price > prev and swing_type != "LOW":
+                    swing_type = "LOW"
+                    swing_time = now
+                elif last_price < prev and swing_type != "HIGH":
+                    swing_type = "HIGH"
+                    swing_time = now
 
-    time.sleep(2)
+            # Save state
+            state[symbol]["prev"] = last_price
+            state[symbol]["last_swing_type"] = swing_type
+            state[symbol]["last_swing_time"] = swing_time
+
+            # Compute "how long ago"
+            if swing_time is None:
+                swing_ago = "null"
+            else:
+                diff = (now - swing_time).total_seconds()
+                if diff < 60:
+                    swing_ago = str(int(diff)) + " sec"
+                else:
+                    swing_ago = str(int(diff / 60)) + " min"
+
+            rows.append({
+                "symbol": symbol,
+                "last": safe(last_price),
+                "ask": safe(ask_price),
+                "bid": safe(bid_price),
+                "spread": safe(round(spread, 4) if spread is not None else None),
+                "swing_ago": safe(swing_ago),
+                "swing_type": safe(swing_type)
+            })
+
+        except Exception:
+            rows.append({
+                "symbol": symbol,
+                "last": "null",
+                "ask": "null",
+                "bid": "null",
+                "spread": "null",
+                "swing_ago": "null",
+                "swing_type": "null"
+            })
+
+    return render_template_string(HTML_PAGE, rows=rows)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

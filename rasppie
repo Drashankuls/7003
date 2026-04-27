@@ -1,231 +1,219 @@
-#drasg
-from flask import Flask, render_template_string
+from flask import Flask, render_template, jsonify
 import requests
-import pytz
-from datetime import datetime, timedelta
-import math
+import time
 
 app = Flask(__name__)
 
-pst = pytz.timezone("America/Los_Angeles")
+YAHOO_GAINERS_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
+ROBINHOOD_QUOTES_URL = "https://api.robinhood.com/quotes/"
 
-symbols = ["AAPL", "TSLA", "MSFT", "AMZN"]
-
-# State per symbol
-state = {}
-for s in symbols:
-    state[s] = {
-        "prev": None,
-        "baseline_price": None,
-        "baseline_time": None,
-        "history": []   # list of (timestamp, price)
+def get_top_gainers_symbols():
+    params = {
+        "scrIds": "day_gainers",
+        "count": 100
     }
+    try:
+        r = requests.get(YAHOO_GAINERS_URL, params=params, timeout=10)
+        data = r.json()
+        result = data.get("finance", {}).get("result", [])
+        if not result:
+            return []
+        quotes = result[0].get("quotes", [])
+        symbols = []
+        for q in quotes:
+            symbol = q.get("symbol")
+            if symbol:
+                symbols.append(symbol)
+        return symbols
+    except Exception:
+        return []
 
-def safe(value):
-    if value is None:
-        return "null"
-    return value
+def get_robinhood_quotes(symbols):
+    if not symbols:
+        return {}
+    joined = ",".join(symbols)
+    params = {"symbols": joined}
+    try:
+        r = requests.get(ROBINHOOD_QUOTES_URL, params=params, timeout=10)
+        data = r.json()
+        results = data.get("results", [])
+        out = {}
+        for q in results:
+            if not q:
+                continue
+            symbol = q.get("symbol")
+            if not symbol:
+                continue
+            try:
+                last = q.get("last_trade_price")
+                bid = q.get("bid_price")
+                ask = q.get("ask_price")
+                volume = q.get("volume")
+                if last is not None:
+                    last = float(last)
+                if bid is not None:
+                    bid = float(bid)
+                if ask is not None:
+                    ask = float(ask)
+                if volume is not None:
+                    volume = int(volume)
+                out[symbol] = {
+                    "last": last,
+                    "bid": bid,
+                    "ask": ask,
+                    "volume": volume
+                }
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
 
-def get_today_630_pst(now_pst):
-    d = now_pst.date()
-    dt = datetime(d.year, d.month, d.day, 6, 30, 0)
-    return pst.localize(dt)
+def get_yahoo_candles(symbol):
+    url = YAHOO_CHART_URL + symbol
+    params = {
+        "interval": "1m",
+        "range": "1d"
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        res0 = result[0]
+        timestamps = res0.get("timestamp", [])
+        indicators = res0.get("indicators", {})
+        quote_list = indicators.get("quote", [])
+        if not quote_list:
+            return None
+        quote = quote_list[0]
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+        if not timestamps or not closes or not volumes:
+            return None
+        return {
+            "timestamps": timestamps,
+            "closes": closes,
+            "volumes": volumes
+        }
+    except Exception:
+        return None
 
-def find_price(history, minutes_ago, now):
-    target = now - timedelta(minutes=minutes_ago)
-    closest = None
-    best_diff = None
+def compute_delta(closes, minutes_back):
+    try:
+        if closes is None:
+            return None
+        n = len(closes)
+        if n < minutes_back + 1:
+            return None
+        last = closes[-1]
+        ref = closes[-(minutes_back + 1)]
+        if last is None or ref is None:
+            return None
+        return float(last) - float(ref)
+    except Exception:
+        return None
 
-    for ts, price in history:
-        diff = abs((ts - target).total_seconds())
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            closest = price
+def compute_volume_window(volumes, minutes_back):
+    try:
+        if volumes is None:
+            return None
+        n = len(volumes)
+        if n < minutes_back:
+            return None
+        window = volumes[-minutes_back:]
+        total = 0
+        for v in window:
+            if v is None:
+                return None
+            total += int(v)
+        return total
+    except Exception:
+        return None
 
-    return closest
+def build_rows():
+    symbols = get_top_gainers_symbols()
+    if not symbols:
+        return []
 
-def color_delta(delta):
-    if delta is None:
-        return "null"
-    if delta > 0:
-        return '<span style="color:lime">+' + str(round(delta, 4)) + '</span>'
-    if delta < 0:
-        return '<span style="color:red">' + str(round(delta, 4)) + '</span>'
-    return str(round(delta, 4))
+    quotes = get_robinhood_quotes(symbols)
+    rows = []
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Live Stock Table</title>
-    <meta http-equiv="refresh" content="2">
-    <style>
-        body { background:#111; color:white; font-family:Arial; }
-        table { border-collapse: collapse; width: 98%; margin-top:20px; }
-        th, td { border:1px solid #444; padding:6px; text-align:center; }
-        th { background:#222; }
-        tr:nth-child(even) { background:#1a1a1a; }
-    </style>
-</head>
-<body>
-    <h2>Live Stock Prices</h2>
-    <table>
-        <tr>
-            <th>Symbol</th>
-            <th>Last</th>
-            <th>Ask</th>
-            <th>Bid</th>
-            <th>Spread</th>
-            <th>Δ1m</th>
-            <th>Δ2m</th>
-            <th>Δ3m</th>
-            <th>Δ5m</th>
-            <th>Δ10m</th>
-            <th>Δ30m</th>
-            <th>Δ60m</th>
-            <th>Δ Since 06:30</th>
-            <th>Slope (deg)</th>
-        </tr>
-        {% for row in rows %}
-        <tr>
-            <td>{{ row.symbol }}</td>
-            <td>{{ row.last }}</td>
-            <td>{{ row.ask }}</td>
-            <td>{{ row.bid }}</td>
-            <td>{{ row.spread }}</td>
-            <td>{{ row.delta1|safe }}</td>
-            <td>{{ row.delta2|safe }}</td>
-            <td>{{ row.delta3|safe }}</td>
-            <td>{{ row.delta5|safe }}</td>
-            <td>{{ row.delta10|safe }}</td>
-            <td>{{ row.delta30|safe }}</td>
-            <td>{{ row.delta60|safe }}</td>
-            <td>{{ row.delta630 }}</td>
-            <td>{{ row.slope }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-</html>
-"""
+    for symbol in symbols:
+        q = quotes.get(symbol)
+        if not q:
+            continue
+
+        last = q.get("last")
+        bid = q.get("bid")
+        ask = q.get("ask")
+        volume_rt = q.get("volume")
+
+        if last is None or bid is None or ask is None:
+            continue
+
+        spread = ask - bid
+
+        candles = get_yahoo_candles(symbol)
+        if not candles:
+            continue
+
+        closes = candles.get("closes")
+        volumes = candles.get("volumes")
+
+        d1 = compute_delta(closes, 1)
+        d2 = compute_delta(closes, 2)
+        d3 = compute_delta(closes, 3)
+        d5 = compute_delta(closes, 5)
+        d10 = compute_delta(closes, 10)
+        d15 = compute_delta(closes, 15)
+        d30 = compute_delta(closes, 30)
+
+        v1 = compute_volume_window(volumes, 1)
+        v3 = compute_volume_window(volumes, 3)
+        v5 = compute_volume_window(volumes, 5)
+
+        required = [d1, d2, d3, d5, d10, d15, d30, v1, v3, v5]
+        missing = False
+        for x in required:
+            if x is None:
+                missing = True
+                break
+        if missing:
+            continue
+
+        row = {
+            "symbol": symbol,
+            "last": last,
+            "bid": bid,
+            "ask": ask,
+            "spread": spread,
+            "d1": d1,
+            "d2": d2,
+            "d3": d3,
+            "d5": d5,
+            "d10": d10,
+            "d15": d15,
+            "d30": d30,
+            "v1": v1,
+            "v3": v3,
+            "v5": v5,
+            "volume_rt": volume_rt
+        }
+        rows.append(row)
+
+    return rows
 
 @app.route("/")
 def index():
-    rows = []
-    now = datetime.now(pst)
-    six_thirty = get_today_630_pst(now)
+    return render_template("dashboard.html")
 
-    for symbol in symbols:
-        try:
-            url = "https://api.robinhood.com/quotes/{}/".format(symbol)
-            data = requests.get(url).json()
-
-            last_raw = data.get("last_trade_price")
-            ask_raw = data.get("ask_price")
-            bid_raw = data.get("bid_price")
-
-            if last_raw is None or ask_raw is None or bid_raw is None:
-                last_price = None
-                ask_price = None
-                bid_price = None
-                spread = None
-            else:
-                last_price = float(last_raw)
-                ask_price = float(ask_raw)
-                bid_price = float(bid_raw)
-                spread = ask_price - bid_price
-
-            baseline_price = state[symbol]["baseline_price"]
-            baseline_time = state[symbol]["baseline_time"]
-
-            # Set baseline at first reading after 06:30
-            if last_price is not None and baseline_price is None and now >= six_thirty:
-                baseline_price = last_price
-                baseline_time = now
-
-            state[symbol]["baseline_price"] = baseline_price
-            state[symbol]["baseline_time"] = baseline_time
-
-            # Update history (keep 60 minutes)
-            if last_price is not None:
-                state[symbol]["history"].append((now, last_price))
-
-            cutoff = now - timedelta(minutes=60)
-            state[symbol]["history"] = [
-                (ts, p) for ts, p in state[symbol]["history"] if ts >= cutoff
-            ]
-
-            history = state[symbol]["history"]
-
-            # Compute deltas
-            def delta(minutes):
-                past = find_price(history, minutes, now)
-                if past is None or last_price is None:
-                    return None
-                return last_price - past
-
-            d1 = delta(1)
-            d2 = delta(2)
-            d3 = delta(3)
-            d5 = delta(5)
-            d10 = delta(10)
-            d30 = delta(30)
-            d60 = delta(60)
-
-            # Delta since 06:30
-            if last_price is not None and baseline_price is not None:
-                delta630 = round(last_price - baseline_price, 4)
-            else:
-                delta630 = "null"
-
-            # Slope angle
-            if last_price is not None and baseline_price is not None and baseline_time is not None:
-                t_sec = (now - baseline_time).total_seconds()
-                if t_sec > 0:
-                    pct_change = (last_price - baseline_price) / baseline_price * 100.0
-                    slope_rad = math.atan(pct_change / t_sec)
-                    slope_deg = round(slope_rad * 180.0 / math.pi, 4)
-                else:
-                    slope_deg = "null"
-            else:
-                slope_deg = "null"
-
-            rows.append({
-                "symbol": symbol,
-                "last": safe(round(last_price, 4) if last_price is not None else None),
-                "ask": safe(round(ask_price, 4) if ask_price is not None else None),
-                "bid": safe(round(bid_price, 4) if bid_price is not None else None),
-                "spread": safe(round(spread, 4) if spread is not None else None),
-                "delta1": color_delta(d1),
-                "delta2": color_delta(d2),
-                "delta3": color_delta(d3),
-                "delta5": color_delta(d5),
-                "delta10": color_delta(d10),
-                "delta30": color_delta(d30),
-                "delta60": color_delta(d60),
-                "delta630": safe(delta630),
-                "slope": safe(slope_deg)
-            })
-
-        except Exception:
-            rows.append({
-                "symbol": symbol,
-                "last": "null",
-                "ask": "null",
-                "bid": "null",
-                "spread": "null",
-                "delta1": "null",
-                "delta2": "null",
-                "delta3": "null",
-                "delta5": "null",
-                "delta10": "null",
-                "delta30": "null",
-                "delta60": "null",
-                "delta630": "null",
-                "slope": "null"
-            })
-
-    return render_template_string(HTML_PAGE, rows=rows)
+@app.route("/data")
+def data():
+    rows = build_rows()
+    return jsonify({"rows": rows, "timestamp": int(time.time())})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=False)

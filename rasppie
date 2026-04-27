@@ -1,39 +1,389 @@
+4/26
+from flask import Flask, jsonify, request
+import requests
+import time
+
+app = Flask(__name__)
+
+YAHOO_GAINERS_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
+ROBINHOOD_QUOTES_URL = "https://api.robinhood.com/quotes/"
+
+############################################################
+# FETCH TOP 100 GAINERS (YAHOO)
+############################################################
+def get_top_gainers_symbols():
+    params = {"scrIds": "day_gainers", "count": 100}
+    try:
+        r = requests.get(YAHOO_GAINERS_URL, params=params, timeout=10)
+        data = r.json()
+        result = data.get("finance", {}).get("result", [])
+        if not result:
+            return []
+        quotes = result[0].get("quotes", [])
+        symbols = []
+        for q in quotes:
+            s = q.get("symbol")
+            if s:
+                symbols.append(s)
+        return symbols
+    except:
+        return []
+
+############################################################
+# FETCH ROBINHOOD QUOTES (BID/ASK/LAST/VOLUME)
+############################################################
+def get_robinhood_quotes(symbols):
+    if not symbols:
+        return {}
+    joined = ",".join(symbols)
+    params = {"symbols": joined}
+    out = {}
+    try:
+        r = requests.get(ROBINHOOD_QUOTES_URL, params=params, timeout=10)
+        data = r.json()
+        results = data.get("results", [])
+        for q in results:
+            if not q:
+                continue
+            symbol = q.get("symbol")
+            if not symbol:
+                continue
+            try:
+                last = q.get("last_trade_price")
+                bid = q.get("bid_price")
+                ask = q.get("ask_price")
+                vol = q.get("volume")
+
+                if last is not None: last = float(last)
+                if bid is not None: bid = float(bid)
+                if ask is not None: ask = float(ask)
+                if vol is not None: vol = int(vol)
+
+                out[symbol] = {
+                    "last": last,
+                    "bid": bid,
+                    "ask": ask,
+                    "volume_rt": vol
+                }
+            except:
+                continue
+        return out
+    except:
+        return {}
+
+############################################################
+# FETCH 1-MINUTE CANDLES (YAHOO)
+############################################################
+def get_yahoo_candles(symbol):
+    url = YAHOO_CHART_URL + symbol
+    params = {"interval": "1m", "range": "1d"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        res0 = result[0]
+        timestamps = res0.get("timestamp", [])
+        quote = res0.get("indicators", {}).get("quote", [{}])[0]
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+        if not timestamps or not closes or not volumes:
+            return None
+        return {"closes": closes, "volumes": volumes}
+    except:
+        return None
+
+############################################################
+# DELTA + VOLUME CALCULATIONS
+############################################################
+def compute_delta(closes, minutes_back):
+    try:
+        if closes is None: return None
+        n = len(closes)
+        if n < minutes_back + 1: return None
+        last = closes[-1]
+        ref = closes[-(minutes_back + 1)]
+        if last is None or ref is None: return None
+        return float(last) - float(ref)
+    except:
+        return None
+
+def compute_volume_window(volumes, minutes_back):
+    try:
+        if volumes is None: return None
+        n = len(volumes)
+        if n < minutes_back: return None
+        total = 0
+        for v in volumes[-minutes_back:]:
+            if v is None:
+                return None
+            total += int(v)
+        return total
+    except:
+        return None
+
+############################################################
+# BUILD FINAL ROWS
+############################################################
+def build_rows():
+    symbols = get_top_gainers_symbols()
+    quotes = get_robinhood_quotes(symbols)
+    rows = []
+
+    for symbol in symbols:
+        q = quotes.get(symbol)
+        if not q:
+            continue
+
+        last = q.get("last")
+        bid = q.get("bid")
+        ask = q.get("ask")
+        vol_rt = q.get("volume_rt")
+
+        if last is None or bid is None or ask is None:
+            continue
+
+        spread = ask - bid
+
+        candles = get_yahoo_candles(symbol)
+        if not candles:
+            continue
+
+        closes = candles["closes"]
+        volumes = candles["volumes"]
+
+        d1 = compute_delta(closes, 1)
+        d2 = compute_delta(closes, 2)
+        d3 = compute_delta(closes, 3)
+        d5 = compute_delta(closes, 5)
+        d10 = compute_delta(closes, 10)
+        d15 = compute_delta(closes, 15)
+        d30 = compute_delta(closes, 30)
+
+        v1 = compute_volume_window(volumes, 1)
+        v3 = compute_volume_window(volumes, 3)
+        v5 = compute_volume_window(volumes, 5)
+
+        required = [d1, d2, d3, d5, d10, d15, d30, v1, v3, v5]
+        missing = False
+        for x in required:
+            if x is None:
+                missing = True
+                break
+        if missing:
+            continue
+
+        rows.append({
+            "symbol": symbol,
+            "last": last,
+            "bid": bid,
+            "ask": ask,
+            "spread": spread,
+            "d1": d1,
+            "d2": d2,
+            "d3": d3,
+            "d5": d5,
+            "d10": d10,
+            "d15": d15,
+            "d30": d30,
+            "v1": v1,
+            "v3": v3,
+            "v5": v5,
+            "volume_rt": vol_rt
+        })
+
+    return rows
+
+############################################################
+# ROUTES
+############################################################
+@app.route("/")
+def index():
+    return """
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Top 100 Gainers Dashboard</title>
-    <link rel="stylesheet" href="/static/dashboard.css">
+<meta charset="utf-8">
+<title>Top 100 Gainers Dashboard</title>
+
+<style>
+body { background:#111; color:#eee; font-family:Arial; padding:10px; }
+h1 { margin:0 0 10px 0; font-size:20px; }
+#last-update { margin-bottom:10px; font-size:12px; color:#ccc; }
+.table-container { max-height:80vh; overflow-y:auto; border:1px solid #444; }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+thead { position:sticky; top:0; background:#222; }
+th,td { padding:4px 6px; border-bottom:1px solid #333; text-align:right; }
+th:first-child, td:first-child { text-align:left; }
+th { color:#ddd; border-bottom:2px solid #555; cursor:pointer; }
+tr:nth-child(even){ background:#181818; }
+tr:nth-child(odd){ background:#141414; }
+.delta { font-weight:bold; }
+.delta.positive { color:#00c853; }
+.delta.negative { color:#ff5252; }
+.delta.neutral { color:#bbbbbb; }
+</style>
+
 </head>
 <body>
-    <h1>Top 100 Gainers (Live)</h1>
-    <div id="last-update">Last update: --</div>
-    <div class="table-container">
-        <table id="gainers-table">
-            <thead>
-                <tr>
-                    <th data-key="symbol">Symbol</th>
-                    <th data-key="last">Last</th>
-                    <th data-key="bid">Bid</th>
-                    <th data-key="ask">Ask</th>
-                    <th data-key="spread">Spread</th>
-                    <th data-key="d1">Δ1m</th>
-                    <th data-key="d2">Δ2m</th>
-                    <th data-key="d3">Δ3m</th>
-                    <th data-key="d5">Δ5m</th>
-                    <th data-key="d10">Δ10m</th>
-                    <th data-key="d15">Δ15m</th>
-                    <th data-key="d30">Δ30m</th>
-                    <th data-key="v1">Vol1m</th>
-                    <th data-key="v3">Vol3m</th>
-                    <th data-key="v5">Vol5m</th>
-                </tr>
-            </thead>
-            <tbody>
-                <!-- Filled by JS -->
-            </tbody>
-        </table>
-    </div>
-    <script src="/static/dashboard.js"></script>
+
+<h1>Top 100 Gainers (Live)</h1>
+<div id="last-update">Last update: --</div>
+
+<div class="table-container">
+<table id="tbl">
+<thead>
+<tr>
+<th data-k="symbol">Symbol</th>
+<th data-k="last">Last</th>
+<th data-k="bid">Bid</th>
+<th data-k="ask">Ask</th>
+<th data-k="spread">Spread</th>
+<th data-k="d1">Δ1m</th>
+<th data-k="d2">Δ2m</th>
+<th data-k="d3">Δ3m</th>
+<th data-k="d5">Δ5m</th>
+<th data-k="d10">Δ10m</th>
+<th data-k="d15">Δ15m</th>
+<th data-k="d30">Δ30m</th>
+<th data-k="v1">Vol1m</th>
+<th data-k="v3">Vol3m</th>
+<th data-k="v5">Vol5m</th>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+</div>
+
+<script>
+var dataRows = [];
+var sortKey = null;
+var sortDir = 1;
+
+function fetchData(){
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET","/data?_="+new Date().getTime(),true);
+    xhr.onreadystatechange=function(){
+        if(xhr.readyState===4 && xhr.status===200){
+            var d = JSON.parse(xhr.responseText);
+            dataRows = d.rows;
+            document.getElementById("last-update").innerHTML = "Last update: " + new Date(d.timestamp*1000).toLocaleTimeString();
+            render();
+        }
+    };
+    xhr.send();
+}
+
+function render(){
+    var tb = document.querySelector("#tbl tbody");
+    tb.innerHTML = "";
+
+    var arr = dataRows.slice(0);
+
+    if(sortKey){
+        arr.sort(function(a,b){
+            var va=a[sortKey], vb=b[sortKey];
+            if(va==null) return 1;
+            if(vb==null) return -1;
+            if(typeof va==="string"){
+                va=va.toUpperCase(); vb=vb.toUpperCase();
+                if(va<vb) return -1*sortDir;
+                if(va>vb) return 1*sortDir;
+                return 0;
+            }
+            if(va<vb) return -1*sortDir;
+            if(va>vb) return 1*sortDir;
+            return 0;
+        });
+    }
+
+    for(var i=0;i<arr.length;i++){
+        var r=arr[i];
+        var tr=document.createElement("tr");
+
+        addCell(tr,r.symbol);
+        addCell(tr,fmt(r.last));
+        addCell(tr,fmt(r.bid));
+        addCell(tr,fmt(r.ask));
+        addCell(tr,fmt(r.spread));
+
+        addDelta(tr,r.d1);
+        addDelta(tr,r.d2);
+        addDelta(tr,r.d3);
+        addDelta(tr,r.d5);
+        addDelta(tr,r.d10);
+        addDelta(tr,r.d15);
+        addDelta(tr,r.d30);
+
+        addCell(tr,r.v1);
+        addCell(tr,r.v3);
+        addCell(tr,r.v5);
+
+        tb.appendChild(tr);
+    }
+}
+
+function addCell(tr,val){
+    var td=document.createElement("td");
+    td.textContent = (val==null?"-":val);
+    tr.appendChild(td);
+}
+
+function addDelta(tr,val){
+    var td=document.createElement("td");
+    if(val==null){
+        td.textContent="-";
+        td.className="delta neutral";
+    } else {
+        td.textContent = fmt(val);
+        if(val>0) td.className="delta positive";
+        else if(val<0) td.className="delta negative";
+        else td.className="delta neutral";
+    }
+    tr.appendChild(td);
+}
+
+function fmt(v){
+    if(v==null) return "-";
+    var n=Number(v);
+    if(isNaN(n)) return "-";
+    return n.toFixed(4);
+}
+
+function setupSort(){
+    var ths=document.querySelectorAll("#tbl thead th");
+    for(var i=0;i<ths.length;i++){
+        ths[i].onclick=function(){
+            var k=this.getAttribute("data-k");
+            if(sortKey===k){
+                sortDir=-sortDir;
+            } else {
+                sortKey=k;
+                sortDir=1;
+            }
+            render();
+        };
+    }
+}
+
+setupSort();
+fetchData();
+setInterval(fetchData,10000);
+</script>
+
 </body>
 </html>
+"""
+
+@app.route("/data")
+def data():
+    rows = build_rows()
+    return jsonify({"rows": rows, "timestamp": int(time.time())})
+
+############################################################
+# RUN SERVER
+############################################################
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

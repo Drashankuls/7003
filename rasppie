@@ -1,178 +1,117 @@
-dk
-from flask import Flask, render_template_string
+6/8
 import requests
 import pytz
-from datetime import datetime, timedelta
+import csv
+import os
+import threading
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
-app = Flask(__name__)
+# ---------------------------------------------------------
+# YOUR STOCK LIST (add as many as you want)
+# ---------------------------------------------------------
+symbols = [
+    "AAPL", "TSLA", "MSFT", "AMZN",
+    "NVDA", "GOOG", "META", "NFLX",
+    "AMD", "INTC", "ORCL"
+]
 
 pst = pytz.timezone("America/Los_Angeles")
 
-symbols = ["AAPL", "TSLA", "MSFT", "AMZN"]
+# ---------------------------------------------------------
+# CSV SETUP
+# ---------------------------------------------------------
+CSV_FILE = "data_log.csv"
 
-# State per symbol
-state = {}
-for s in symbols:
-    state[s] = {
-        "history": []   # list of (timestamp, last_price)
-    }
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp", "symbol",
+            "ask_robinhood", "bid_robinhood", "last_robinhood",
+            "price_yahoo", "price_nasdaq"
+        ])
 
-def safe(value):
-    if value is None:
-        return "null"
-    return value
+# ---------------------------------------------------------
+# FETCH FUNCTIONS
+# ---------------------------------------------------------
 
-def color_delta(delta):
-    if delta is None:
-        return "null"
-    if delta > 0:
-        return '<span style="color:lime">+' + str(round(delta, 4)) + '</span>'
-    if delta < 0:
-        return '<span style="color:red">' + str(round(delta, 4)) + '</span>'
-    return str(round(delta, 4))
+def fetch_yahoo(symbol):
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+    try:
+        data = requests.get(url, timeout=2).json()
+        return data["quoteResponse"]["result"][0].get("regularMarketPrice")
+    except:
+        return None
 
-def find_price(history, seconds_ago, now):
-    target = now - timedelta(seconds=seconds_ago)
-    closest = None
-    best_diff = None
+def fetch_nasdaq(symbol):
+    url = f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass=stocks"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        data = requests.get(url, headers=headers, timeout=2).json()
+        return float(data["data"]["primaryData"]["lastSalePrice"].replace("$", ""))
+    except:
+        return None
 
-    for ts, price in history:
-        diff = abs((ts - target).total_seconds())
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            closest = price
+# ---------------------------------------------------------
+# BACKGROUND LOGGER (runs every 2 seconds)
+# ---------------------------------------------------------
 
-    return closest
+def background_logger():
+    pool = ThreadPoolExecutor(max_workers=20)
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Fast Stock Table</title>
-    <meta http-equiv="refresh" content="2">
-    <style>
-        body { background:#111; color:white; font-family:Arial; }
-        table { border-collapse: collapse; width: 98%; margin-top:20px; }
-        th, td { border:1px solid #444; padding:6px; text-align:center; }
-        th { background:#222; }
-        tr:nth-child(even) { background:#1a1a1a; }
-        h2 { margin-bottom: 5px; }
-    </style>
-</head>
-<body>
-    <h2>Live Stock Prices</h2>
-    <div>Last Updated: {{ updated }}</div>
+    while True:
+        now = datetime.now(pst)
 
-    <table>
-        <tr>
-            <th>Symbol</th>
-            <th>Ask</th>
-            <th>Bid</th>
-            <th>Spread</th>
-            <th>Δ15s</th>
-            <th>Δ30s</th>
-            <th>Δ45s</th>
-            <th>Δ1m</th>
-            <th>Δ2m</th>
-        </tr>
-        {% for row in rows %}
-        <tr>
-            <td>{{ row.symbol }}</td>
-            <td>{{ row.ask }}</td>
-            <td>{{ row.bid }}</td>
-            <td>{{ row.spread }}</td>
-            <td>{{ row.delta15|safe }}</td>
-            <td>{{ row.delta30|safe }}</td>
-            <td>{{ row.delta45|safe }}</td>
-            <td>{{ row.delta60|safe }}</td>
-            <td>{{ row.delta120|safe }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-</html>
-"""
-
-@app.route("/")
-def index():
-    rows = []
-    now = datetime.now(pst)
-
-    # ONE FAST REQUEST FOR ALL SYMBOLS
-    url = "https://api.robinhood.com/quotes/?symbols=" + ",".join(symbols)
-    data = requests.get(url).json()
-
-    results = data.get("results", [])
-
-    for item in results:
+        # Robinhood batch request
+        url = "https://api.robinhood.com/quotes/?symbols=" + ",".join(symbols)
         try:
+            rh_data = requests.get(url, timeout=3).json().get("results", [])
+        except:
+            rh_data = []
+
+        # Prepare async Yahoo/Nasdaq fetches
+        futures = {}
+        for item in rh_data:
+            symbol = item.get("symbol")
+            futures[symbol] = {
+                "yahoo": pool.submit(fetch_yahoo, symbol),
+                "nasdaq": pool.submit(fetch_nasdaq, symbol)
+            }
+
+        # Process results + write CSV
+        for item in rh_data:
             symbol = item.get("symbol")
 
-            ask_raw = item.get("ask_price")
-            bid_raw = item.get("bid_price")
-            last_raw = item.get("last_trade_price")
+            ask = float(item.get("ask_price")) if item.get("ask_price") else None
+            bid = float(item.get("bid_price")) if item.get("bid_price") else None
+            last = float(item.get("last_trade_price")) if item.get("last_trade_price") else None
 
-            if ask_raw is None or bid_raw is None or last_raw is None:
-                ask_price = None
-                bid_price = None
-                last_price = None
-                spread = None
-            else:
-                ask_price = float(ask_raw)
-                bid_price = float(bid_raw)
-                last_price = float(last_raw)
-                spread = ask_price - bid_price
+            yahoo_price = futures[symbol]["yahoo"].result()
+            nasdaq_price = futures[symbol]["nasdaq"].result()
 
-            # Update history (keep only 2 minutes)
-            if last_price is not None:
-                state[symbol]["history"].append((now, last_price))
+            with open(CSV_FILE, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    symbol,
+                    ask, bid, last,
+                    yahoo_price,
+                    nasdaq_price
+                ])
 
-            cutoff = now - timedelta(seconds=120)
-            state[symbol]["history"] = [
-                (ts, p) for ts, p in state[symbol]["history"] if ts >= cutoff
-            ]
+        time.sleep(2)
 
-            history = state[symbol]["history"]
-
-            # Compute deltas
-            def delta(sec):
-                past = find_price(history, sec, now)
-                if past is None or last_price is None:
-                    return None
-                return last_price - past
-
-            d15 = delta(15)
-            d30 = delta(30)
-            d45 = delta(45)
-            d60 = delta(60)
-            d120 = delta(120)
-
-            rows.append({
-                "symbol": symbol,
-                "ask": safe(round(ask_price, 4) if ask_price is not None else None),
-                "bid": safe(round(bid_price, 4) if bid_price is not None else None),
-                "spread": safe(round(spread, 4) if spread is not None else None),
-                "delta15": color_delta(d15),
-                "delta30": color_delta(d30),
-                "delta45": color_delta(d45),
-                "delta60": color_delta(d60),
-                "delta120": color_delta(d120)
-            })
-
-        except Exception:
-            rows.append({
-                "symbol": "null",
-                "ask": "null",
-                "bid": "null",
-                "spread": "null",
-                "delta15": "null",
-                "delta30": "null",
-                "delta45": "null",
-                "delta60": "null",
-                "delta120": "null"
-            })
-
-    return render_template_string(HTML_PAGE, rows=rows, updated=now.strftime("%H:%M:%S"))
+# ---------------------------------------------------------
+# START LOGGER
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    print("Starting stock logger…")
+    t = threading.Thread(target=background_logger, daemon=True)
+    t.start()
+
+    # Keep main thread alive
+    while True:
+        time.sleep(1)

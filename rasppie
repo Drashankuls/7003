@@ -1,4 +1,4 @@
-6/8
+6/8n
 import requests
 import pytz
 import csv
@@ -38,7 +38,7 @@ if not os.path.exists(CSV_FILE):
 # ---------------------------------------------------------
 
 def fetch_yahoo(symbol):
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+    url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}".format(symbol)
     try:
         data = requests.get(url, timeout=2).json()
         return data["quoteResponse"]["result"][0].get("regularMarketPrice")
@@ -46,11 +46,12 @@ def fetch_yahoo(symbol):
         return None
 
 def fetch_nasdaq(symbol):
-    url = f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass=stocks"
+    url = "https://api.nasdaq.com/api/quote/{}/info?assetclass=stocks".format(symbol)
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         data = requests.get(url, headers=headers, timeout=2).json()
-        return float(data["data"]["primaryData"]["lastSalePrice"].replace("$", ""))
+        price_str = data["data"]["primaryData"]["lastSalePrice"]
+        return float(price_str.replace("$", ""))
     except:
         return None
 
@@ -84,9 +85,13 @@ def background_logger():
         for item in rh_data:
             symbol = item.get("symbol")
 
-            ask = float(item.get("ask_price")) if item.get("ask_price") else None
-            bid = float(item.get("bid_price")) if item.get("bid_price") else None
-            last = float(item.get("last_trade_price")) if item.get("last_trade_price") else None
+            ask_raw = item.get("ask_price")
+            bid_raw = item.get("bid_price")
+            last_raw = item.get("last_trade_price")
+
+            ask = float(ask_raw) if ask_raw else None
+            bid = float(bid_raw) if bid_raw else None
+            last = float(last_raw) if last_raw else None
 
             yahoo_price = futures[symbol]["yahoo"].result()
             nasdaq_price = futures[symbol]["nasdaq"].result()
@@ -108,10 +113,11 @@ def background_logger():
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Starting stock logger…")
+    print("Starting stock logger...")
     t = threading.Thread(target=background_logger, daemon=True)
     t.start()
 
     # Keep main thread alive
     while True:
         time.sleep(1)
+
